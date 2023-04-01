@@ -31,20 +31,47 @@ func NewGrooveQueue(queueCap uint32) *GrooveQueue {
 		head:       0,
 		tail:       0,
 		writeState: 0,
+		len:        0,
 		buffer:     make([]interface{}, capi),
 	}
 }
 
 func (q *GrooveQueue) EnQueue(data interface{}) bool {
 	for {
-		tail := atomic.LoadUint32(&q.tail)
-		nextTail := (tail + 1) & q.mask
-		if nextTail == atomic.LoadUint32(&q.head) {
+		if q.cap == q.Len() {
 			return false
 		}
+		tail := atomic.LoadUint32(&q.tail)
+		nextTail := (tail + 1) & q.mask
+
 		if atomic.CompareAndSwapUint32(&q.tail, tail, nextTail) {
+			atomic.AddUint32(&q.writeState, 1)
 			q.buffer[tail] = data
-			atomic.StoreUint32(&q.writeState, nextTail)
+			atomic.AddUint32(&q.len, 1)
+			atomic.AddUint32(&q.writeState, ^uint32(0))
+			return true
+		} else {
+			runtime.Gosched()
+		}
+	}
+}
+
+func (q *GrooveQueue) EnQueueBatch(data []interface{}) bool {
+	n := uint32(len(data))
+	for {
+		if q.cap-q.Len() < n {
+			return false
+		}
+		tail := atomic.LoadUint32(&q.tail)
+		nextTail := (tail + n) & q.mask
+
+		if atomic.CompareAndSwapUint32(&q.tail, tail, nextTail) {
+			atomic.AddUint32(&q.writeState, n)
+			for i := uint32(0); i < n; i++ {
+				q.buffer[(tail+i)&q.mask] = data
+			}
+			atomic.AddUint32(&q.len, n)
+			atomic.AddUint32(&q.writeState, ^(n - 1))
 			return true
 		} else {
 			runtime.Gosched()
@@ -54,13 +81,64 @@ func (q *GrooveQueue) EnQueue(data interface{}) bool {
 
 func (q *GrooveQueue) DeQueue() (interface{}, bool) {
 	for {
-		head := atomic.LoadUint32(&q.head)
-		nextHead := (head + 1) & q.mask
-		if head == atomic.LoadUint32(&q.tail) {
+		if q.Len() == 0 {
 			return nil, false
 		}
+		head := atomic.LoadUint32(&q.head)
+		nextHead := (head + 1) & q.mask
+		tail := atomic.LoadUint32(&q.tail)
+		state := atomic.LoadUint32(&q.writeState)
+		tailBox := (nextHead + state) & q.mask
+		if nextHead <= tail {
+			if tailBox > tail || tailBox < nextHead {
+				runtime.Gosched()
+				continue
+			}
+		} else {
+			if tailBox > tail && tailBox < nextHead {
+				runtime.Gosched()
+				continue
+			}
+		}
+
 		value := q.buffer[head]
-		if atomic.LoadUint32(&q.writeState) != head && atomic.CompareAndSwapUint32(&q.head, head, nextHead) {
+		if atomic.CompareAndSwapUint32(&q.head, head, nextHead) {
+			atomic.AddUint32(&q.len, ^uint32(0))
+			return value, true
+		} else {
+			runtime.Gosched()
+		}
+	}
+}
+
+func (q *GrooveQueue) DeQueueBatch(n uint32) ([]interface{}, bool) {
+	for {
+		if q.Len() < n {
+			return nil, false
+		}
+		head := atomic.LoadUint32(&q.head)
+		nextHead := (head + n) & q.mask
+		tail := atomic.LoadUint32(&q.tail)
+		state := atomic.LoadUint32(&q.writeState)
+		tailBox := (nextHead + state) & q.mask
+		if nextHead <= tail {
+			if tailBox > tail || tailBox < nextHead {
+				runtime.Gosched()
+				continue
+			}
+		} else if nextHead > tail {
+			if tailBox > tail && tailBox < nextHead {
+				runtime.Gosched()
+				continue
+			}
+		}
+
+		value := make([]interface{}, 0, n)
+		for i := uint32(0); i < n; i++ {
+			value = append(value, q.buffer[(head+i)&q.mask])
+		}
+		if atomic.CompareAndSwapUint32(&q.head, head, nextHead) {
+			atomic.AddUint32(&q.len, ^(n - 1))
 			return value, true
 		} else {
 			runtime.Gosched()
@@ -69,11 +147,5 @@ func (q *GrooveQueue) DeQueue() (interface{}, bool) {
 }
 
 func (q *GrooveQueue) Len() uint32 {
-	head := atomic.LoadUint32(&q.head)
-	tail := atomic.LoadUint32(&q.tail)
-	if head <= tail {
-		return tail - head
-	} else {
-		return head - tail
-	}
+	return atomic.LoadUint32(&q.len)
 }
